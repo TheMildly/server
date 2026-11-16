@@ -8,8 +8,9 @@ under a free or own address through Caddy. The app lives in a separate repositor
 
 - `docs/SERVER.md` — trust model, pairing, the API, containers, addresses, install, the order
   of work and what is still undecided. **Read it before changing the engine.**
-- `LICENSE.md` — closed source: permission to use only. Never add an open-source licence or
-  licence headers that say otherwise.
+- `LICENSE` — Apache License 2.0; `NOTICE` names the copyright holder. The Mildly app is
+  closed source: never copy its code into this repository. Describing the wire format both
+  sides speak is fine.
 
 ## Rules
 

@@ -43,4 +43,5 @@ cargo run -- run --config ./config.toml   # an empty file is a valid config; set
 How it works (trust model, pairing, API, containers, addresses, install, order of work):
 [`docs/SERVER.md`](docs/SERVER.md).
 
-Mildly Server is closed source: permission to use only. See [`LICENSE.md`](LICENSE.md).
+Mildly Server is open source under the [Apache License 2.0](LICENSE). The Mildly app it pairs
+with is closed source and lives elsewhere.

@@ -3,7 +3,7 @@ name = "mildly-server"
 version = "0.1.0"
 edition = "2024"
 description = "Mildly Server: the personal server the Mildly app pairs with"
-license-file = "LICENSE.md"
+license = "Apache-2.0"
 publish = false
 
 [dependencies]
