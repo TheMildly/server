@@ -245,13 +245,11 @@ firewall is on, starts the service, offers a free name (`--free-names EMAIL`,
 | `mildly-server free-names --email ADDRESS` / `--token TOKEN` | Free names through deSEC |
 | `mildly-server version` | |
 
-**Releases.** Pushing a tag such as `v0.1.0` (the `version` in `Cargo.toml`) runs
-`.github/workflows/build.yml`: it builds `mildly-server-x86_64` and `mildly-server-aarch64`
+**Releases.** Running `.github/workflows/build.yml` with "Publish a release" ticked (or pushing
+a tag such as `v0.1.0`, the `version` in `Cargo.toml`) builds `mildly-server-x86_64` and `mildly-server-aarch64`
 on Ubuntu 22.04, so they also run on older distributions, and publishes them with
-`install.sh` as a GitHub release, which is where the installer downloads from. Running the
-workflow by hand only builds them and attaches them to the run. While the repository is
-private, release files cannot be downloaded without signing in: download them yourself and
-install with `--binary`.
+`install.sh` as a GitHub release, which is where the installer downloads from. Running it
+without the box ticked only builds them and attaches them to the run.
 
 ## 9. Order of work and state
 

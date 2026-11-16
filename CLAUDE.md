@@ -39,5 +39,6 @@ There is no test suite. Before saying something works: `cargo build` without war
 run the engine against a real Docker and drive it from the app (`npm run dev:live` in the
 app repository; in dev mode `window.__app` is the store).
 
-Releases: bump `version` in `Cargo.toml`, push a tag `v<version>`; `.github/workflows/build.yml`
-publishes the binaries and `install.sh`.
+Releases: bump `version` in `Cargo.toml`, then Actions → Build → Run workflow with "Publish a
+release" ticked (or push a tag `v<version>`); `.github/workflows/build.yml` tags the commit
+and publishes the binaries and `install.sh`.

@@ -1,11 +1,17 @@
 # Builds the engine for Linux on both processor families.
-#   - A tag such as v0.1.0 publishes a GitHub release with both binaries and install.sh,
-#     which is where the installer downloads from.
-#   - Actions → Build → Run workflow only builds them and attaches them to the run.
+#   - Actions → Build → Run workflow builds them and attaches them to the run. With "Publish
+#     a release" ticked it also tags the commit v<version in Cargo.toml> and publishes a
+#     GitHub release with both binaries and install.sh, which is where the installer
+#     downloads from. Pushing such a tag does the same.
 name: Build
 
 on:
   workflow_dispatch:
+    inputs:
+      release:
+        description: 'Publish a release for the version in Cargo.toml'
+        type: boolean
+        default: false
   push:
     tags: ['v*']
 
@@ -46,7 +52,7 @@ jobs:
           path: out/*
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.release
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -59,10 +65,13 @@ jobs:
           path: out
           merge-multiple: true
 
-      - name: Check the tag matches the version
+      - name: Work out the tag
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "Tag $GITHUB_REF_NAME does not match version $version in Cargo.toml"; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match version $version in Cargo.toml"; exit 1
+          fi
+          echo "TAG=v$version" >> "$GITHUB_ENV"
 
       - name: Publish
         env:
@@ -70,4 +79,4 @@ jobs:
         run: |
           cp install.sh LICENSE NOTICE out/
           (cd out && sha256sum mildly-server-* install.sh > SHA256SUMS)
-          gh release create "$GITHUB_REF_NAME" out/* --title "Mildly Server $GITHUB_REF_NAME" --generate-notes
+          gh release create "$TAG" out/* --target "$GITHUB_SHA" --title "Mildly Server $TAG" --generate-notes
