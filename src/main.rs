@@ -13,10 +13,12 @@ mod metrics;
 mod pairing;
 mod rpc;
 mod runtime;
+mod space;
 mod state;
 mod terminal;
 
 use anyhow::{Context, Result};
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use axum::Router;
 use config::Config;
@@ -38,7 +40,11 @@ pub struct App {
   pub disk_gb: u32,
   /// Where the app can reach the API, best first ("203.0.113.5:7680").
   pub addresses: Vec<String>,
-  pub pairing: Mutex<Option<pairing::Pairing>>,
+  /// Codes that are open now: the installer's and any invites.
+  pub pairing: Mutex<Vec<pairing::Pairing>>,
+  pub invites: Mutex<HashMap<String, space::Invite>>,
+  /// Uploads under way: what was announced, and when they started.
+  pub uploads: Mutex<HashMap<String, (space::Meta, std::time::Instant)>>,
   pub nonces: Mutex<HashMap<String, u64>>,
   pub metrics: Arc<metrics::Metrics>,
   pub containers: Option<Arc<runtime::Containers>>,
@@ -113,7 +119,9 @@ async fn run(config: Config) -> Result<()> {
     disk_gb: metrics::disk_total_gb(&config.data_dir),
     key,
     store,
-    pairing: Mutex::new(None),
+    pairing: Mutex::new(Vec::new()),
+    invites: Mutex::new(HashMap::new()),
+    uploads: Mutex::new(HashMap::new()),
     nonces: Mutex::new(HashMap::new()),
     metrics: Arc::new(metrics::Metrics::default()),
     containers,
@@ -127,6 +135,16 @@ async fn run(config: Config) -> Result<()> {
   tokio::spawn(pairing::lan_responder(app.clone()));
   tokio::spawn(admin(app.clone()));
   tokio::spawn(domains::keep(app.clone()));
+  {
+    let app = app.clone();
+    tokio::spawn(async move {
+      loop {
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        space::sweep(&app);
+        space::tidy_invites(&app);
+      }
+    });
+  }
 
   // A fresh server prints its first code by itself, so the installer's output ends with it.
   if app.store.read(|s| s.devices.is_empty()) {
@@ -137,6 +155,8 @@ async fn run(config: Config) -> Result<()> {
   let router = Router::new()
     .route("/v1/hello", get(rpc::hello))
     .route("/v1/rpc", post(rpc::rpc))
+    // Files and chats arrive in pieces of up to 8 MB, base64 inside the sealed envelope.
+    .layer(DefaultBodyLimit::max(24 * 1024 * 1024))
     .layer(CorsLayer::permissive())
     .with_state(app.clone());
   let listener = tokio::net::TcpListener::bind(&app.config.listen).await.with_context(|| format!("listening on {}", app.config.listen))?;

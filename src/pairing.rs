@@ -1,6 +1,14 @@
 //! Pairing codes (docs/SERVER.md, section 3): twelve digits, one use, ten minutes, five tries.
-//! While a code is valid the engine answers LAN discovery and posts an encrypted
-//! announcement to the rendezvous, so the app can find it from the digits alone.
+//!
+//! Two kinds share the same path for the joining device:
+//! - the installer's code (and `mildly-server pair`), made here;
+//! - an invite, made on a paired device, so that the engine never learns the code. The device
+//!   sends what the engine needs to announce it and to check the joining device: the topic,
+//!   the announcement key and the proof. None of them reveals the code.
+//!
+//! While a code is valid the engine answers LAN discovery and posts an encrypted announcement
+//! to the rendezvous, so the app can find it from the digits alone. The joining device proves
+//! it knows the code with `HMAC(codeKey, "proof")`; the code itself never travels.
 
 use crate::crypto;
 use crate::App;
@@ -16,11 +24,13 @@ pub const LIFETIME: Duration = Duration::from_secs(600);
 pub const MAX_TRIES: u32 = 5;
 
 pub struct Pairing {
-  pub code: String,
+  pub proof: [u8; 32],
   pub topic: String,
   pub announcement: String,
   pub expires: Instant,
   pub tries: u32,
+  /// The invite this code belongs to; `None` for the installer's code.
+  pub invite: Option<String>,
 }
 
 /// Twelve uniformly random digits.
@@ -51,30 +61,59 @@ pub fn qr_text(payload: &str) -> String {
   }
 }
 
-/// Makes a fresh code, replacing any earlier one, and starts announcing it.
-pub async fn start(app: Arc<App>) -> String {
-  let code = digits();
-  let key = {
-    let code = code.clone();
-    tokio::task::spawn_blocking(move || crypto::code_key(&code)).await.expect("pbkdf2 task")
-  };
+fn announcement(app: &App, announce_key: &[u8; 32]) -> String {
   let body = json!({
     "v": 1,
     "a": app.addresses,
     "k": crypto::b64(app.key.public_raw()),
     "n": app.name,
   });
-  let pairing = Pairing {
-    code: code.clone(),
-    topic: crypto::topic(&key),
-    announcement: crypto::seal_announcement(&key, body.to_string().as_bytes()),
-    expires: Instant::now() + LIFETIME,
-    tries: 0,
-  };
+  crypto::seal_announcement(announce_key, body.to_string().as_bytes())
+}
+
+fn add(app: &Arc<App>, pairing: Pairing) {
   let topic = pairing.topic.clone();
-  *app.pairing.lock().expect("pairing lock") = Some(pairing);
+  let mut all = app.pairing.lock().expect("pairing lock");
+  all.retain(|p| p.expires > Instant::now());
+  // A new installer code replaces the earlier one; invites live side by side.
+  if pairing.invite.is_none() {
+    all.retain(|p| p.invite.is_some());
+  }
+  all.push(pairing);
+  drop(all);
   tokio::spawn(announce(app.clone(), topic));
+}
+
+/// Makes a fresh installer code, replacing any earlier one, and starts announcing it.
+pub async fn start(app: Arc<App>) -> String {
+  let code = digits();
+  let key = {
+    let code = code.clone();
+    tokio::task::spawn_blocking(move || crypto::code_key(&code)).await.expect("pbkdf2 task")
+  };
+  add(
+    &app,
+    Pairing {
+      proof: crypto::code_tag(&key, b"proof"),
+      topic: crypto::topic(&key),
+      announcement: announcement(&app, &crypto::announce_key(&key)),
+      expires: Instant::now() + LIFETIME,
+      tries: 0,
+      invite: None,
+    },
+  );
   code
+}
+
+/// Starts announcing an invite made on a device. Returns when it expires.
+pub fn start_invite(app: &Arc<App>, invite: &str, topic: String, announce_key: [u8; 32], proof: [u8; 32]) -> Instant {
+  let expires = Instant::now() + LIFETIME;
+  add(app, Pairing { proof, topic, announcement: announcement(app, &announce_key), expires, tries: 0, invite: Some(invite.to_string()) });
+  expires
+}
+
+pub fn cancel_invite(app: &App, invite: &str) {
+  app.pairing.lock().expect("pairing lock").retain(|p| p.invite.as_deref() != Some(invite));
 }
 
 /// Posts the announcement to the rendezvous now and every two minutes while the code lives.
@@ -85,15 +124,20 @@ async fn announce(app: Arc<App>, topic: String) {
   let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().expect("http client");
   loop {
     let message = {
-      let guard = app.pairing.lock().expect("pairing lock");
-      match guard.as_ref() {
-        Some(p) if p.topic == topic && p.expires > Instant::now() => p.announcement.clone(),
-        _ => return,
+      let all = app.pairing.lock().expect("pairing lock");
+      match all.iter().find(|p| p.topic == topic && p.expires > Instant::now()) {
+        Some(p) => p.announcement.clone(),
+        None => return,
       }
     };
     let url = format!("{}/{}", app.config.rendezvous.trim_end_matches('/'), topic);
-    if let Err(e) = client.post(&url).body(message).send().await {
-      tracing::warn!("rendezvous unreachable: {e}");
+    match client.post(&url).body(message).send().await {
+      Ok(res) if !res.status().is_success() => {
+        // ntfy.sh limits free messages per address and day; LAN discovery and the QR code still work.
+        tracing::warn!("the rendezvous refused the announcement ({}); the code still works on the local network and by QR code", res.status());
+      }
+      Ok(_) => {}
+      Err(e) => tracing::warn!("rendezvous unreachable: {e}"),
     }
     tokio::time::sleep(Duration::from_secs(120)).await;
   }
@@ -112,8 +156,8 @@ pub async fn lan_responder(app: Arc<App>) {
       continue;
     };
     let reply = {
-      let guard = app.pairing.lock().expect("pairing lock");
-      guard.as_ref().filter(|p| p.topic == asked && p.expires > Instant::now()).map(|p| p.announcement.clone())
+      let all = app.pairing.lock().expect("pairing lock");
+      all.iter().find(|p| p.topic == asked && p.expires > Instant::now()).map(|p| p.announcement.clone())
     };
     if let Some(reply) = reply {
       let _ = socket.send_to(reply.as_bytes(), from).await;
@@ -122,28 +166,28 @@ pub async fn lan_responder(app: Arc<App>) {
 }
 
 pub enum Check {
-  Ok,
+  /// The code was right; `Some` names the invite it belonged to.
+  Ok(Option<String>),
   Wrong,
   Expired,
 }
 
-/// Checks a code and uses it up. Wrong tries count; the fifth ends the code.
-pub fn check(app: &App, offered: &str) -> Check {
-  let mut guard = app.pairing.lock().expect("pairing lock");
-  let Some(p) = guard.as_mut() else { return Check::Expired };
-  if p.expires <= Instant::now() {
-    *guard = None;
+/// Checks a proof and uses its code up. A wrong try counts against every open code; the
+/// fifth ends them.
+pub fn check(app: &App, offered: &[u8]) -> Check {
+  let mut all = app.pairing.lock().expect("pairing lock");
+  all.retain(|p| p.expires > Instant::now());
+  if all.is_empty() {
     return Check::Expired;
   }
-  let same = p.code.len() == offered.len() && p.code.bytes().zip(offered.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
-  if same {
-    *guard = None;
-    return Check::Ok;
+  let same = |p: &Pairing| offered.len() == 32 && p.proof.iter().zip(offered).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
+  if let Some(i) = all.iter().position(same) {
+    let p = all.remove(i);
+    return Check::Ok(p.invite);
   }
-  p.tries += 1;
-  if p.tries >= MAX_TRIES {
-    *guard = None;
-    return Check::Expired;
+  for p in all.iter_mut() {
+    p.tries += 1;
   }
-  Check::Wrong
+  all.retain(|p| p.tries < MAX_TRIES);
+  if all.is_empty() { Check::Expired } else { Check::Wrong }
 }

@@ -2,6 +2,7 @@
 
 use crate::crypto::{self, b64, unb64};
 use crate::domains;
+use crate::space;
 use crate::pairing::{self, Check};
 use crate::runtime::Spec;
 use crate::state::{now_ms, Device};
@@ -56,8 +57,10 @@ impl From<anyhow::Error> for Fail {
 }
 
 /// Codes the engine's modules raise as plain errors and the app knows.
-const CODES: [&str; 15] = [
+const CODES: [&str; 17] = [
   "exists",
+  "quota",
+  "bad-request",
   "not-found",
   "bad-kind",
   "bad-name",
@@ -134,7 +137,10 @@ async fn handle(app: &Arc<App>, call: &Call, host: &str) -> Out {
 
   match call.m.as_str() {
     "load" => snapshot(app, &device, host, true).await,
-    "setup" => owner(setup(app, &device, &params, host).await),
+    "setup" if device.owner => setup(app, &device, &params, host).await,
+    // A device that joined later walks the same wizard; the owner's choices stay.
+    "setup" if app.store.read(|s| s.setup_done) => snapshot(app, &device, host, false).await,
+    "setup" => Err(Fail("not-owner")),
     "unpair" => {
       app.store.write(|s| s.devices.retain(|d| d.id != device.id)).map_err(Fail::from)?;
       Ok(Value::Null)
@@ -228,9 +234,117 @@ async fn handle(app: &Arc<App>, call: &Call, host: &str) -> Out {
       app.store.write(|s| s.quota_gb = gb)?;
       Ok(Value::Null)
     }.await),
+
+    /* ---------- devices ---------- */
+    "invite.create" => owner(async {
+      let raw = |k: &str| -> Result<[u8; 32], Fail> { unb64(&text(k)).ok().and_then(|b| b.try_into().ok()).ok_or(Fail("bad-request")) };
+      let (announce, proof) = (raw("announceKey")?, raw("proof")?);
+      let topic = text("topic");
+      if !topic.starts_with("mildly-") || topic.len() > 40 {
+        return Err(Fail("bad-request"));
+      }
+      space::tidy_invites(app);
+      let id = format!("i{}", hex::encode(crypto::random(6)));
+      let expires = pairing::start_invite(app, &id, topic, announce, proof);
+      app.invites.lock().expect("invites lock").insert(id.clone(), space::Invite { from: device.id.clone(), expires, joined: None, sealed: None });
+      Ok(json!({ "id": id, "expiresAt": space::epoch_ms(expires) }))
+    }.await),
+    "invite.status" => {
+      let id = text("id");
+      let all = app.invites.lock().expect("invites lock");
+      let Some(i) = all.get(&id).filter(|i| i.from == device.id) else { return Ok(json!({ "state": "expired" })) };
+      match &i.joined {
+        Some((joined, boxed, tag)) => {
+          let d = app.store.read(|s| s.devices.iter().find(|d| &d.id == joined).cloned());
+          Ok(json!({ "state": "joined", "device": d.map(|d| device_info(&d, &device.id)), "box": boxed, "boxTag": tag }))
+        }
+        None if i.expires <= std::time::Instant::now() => Ok(json!({ "state": "expired" })),
+        None => Ok(json!({ "state": "waiting" })),
+      }
+    }
+    "invite.deliver" => {
+      let mut all = app.invites.lock().expect("invites lock");
+      let i = all.get_mut(&text("id")).filter(|i| i.from == device.id && i.joined.is_some()).ok_or(Fail("not-found"))?;
+      i.sealed = params.get("sealed").cloned();
+      Ok(Value::Null)
+    }
+    "invite.cancel" => {
+      let id = text("id");
+      let mut all = app.invites.lock().expect("invites lock");
+      if all.get(&id).is_some_and(|i| i.from == device.id) {
+        all.remove(&id);
+        pairing::cancel_invite(app, &id);
+      }
+      Ok(Value::Null)
+    }
+    "space.receive" => {
+      let mut all = app.invites.lock().expect("invites lock");
+      let found = all.iter().find(|(_, i)| i.joined.as_ref().is_some_and(|j| j.0 == device.id) && i.sealed.is_some()).map(|(id, _)| id.clone());
+      Ok(found.and_then(|id| all.remove(&id)).and_then(|i| i.sealed).unwrap_or(Value::Null))
+    }
+    "devices.remove" => owner(async {
+      let id = text("id");
+      if id == device.id {
+        return Err(Fail("bad-request"));
+      }
+      app.store.write(|s| s.devices.retain(|d| d.id != id))?;
+      Ok(Value::Null)
+    }.await),
+
+    /* ---------- the space: files, chats, memory ---------- */
+    "storage.list" => Ok(json!(space::items(app))),
+    "storage.begin" => Ok(json!({ "id": space::begin(app, &text("origin"), number("size").unwrap_or(0), &text("desc"))? })),
+    "storage.put" => {
+      let data = unb64(&text("data")).map_err(|_| Fail("bad-request"))?;
+      space::put(app, &text("id"), number("offset").unwrap_or(0), &data)?;
+      Ok(Value::Null)
+    }
+    "storage.end" => Ok(space::end(app, &text("id"))?),
+    "storage.get" => Ok(json!(b64(&space::get(app, &text("id"), number("offset").unwrap_or(0), number("length").unwrap_or(0) as usize)?))),
+    "storage.remove" => {
+      space::remove(app, &text("id"))?;
+      Ok(Value::Null)
+    }
+    "context.put" => {
+      let data = unb64(&text("data")).map_err(|_| Fail("bad-request"))?;
+      space::put_chat(app, &text("id"), &data)?;
+      Ok(Value::Null)
+    }
+    "context.list" => Ok(json!(space::chats_since(app, number("since").unwrap_or(0))?)),
+    "context.drop" => {
+      space::drop_chat(app, &text("id"))?;
+      Ok(Value::Null)
+    }
+    "memory.put" => {
+      let data = unb64(&text("data")).map_err(|_| Fail("bad-request"))?;
+      space::put_memory(app, &data)?;
+      Ok(Value::Null)
+    }
+    "memory.get" => Ok(space::memory(app).unwrap_or(Value::Null)),
+
+    /* ---------- upkeep ---------- */
+    "server.restart" => owner(async {
+      tracing::info!("restarting, as asked from {}", device.name);
+      // The answer goes out first; the service manager starts the engine again.
+      tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        std::process::exit(75);
+      });
+      Ok(Value::Null)
+    }.await),
+    "update.check" => Ok(json!({ "current": env!("CARGO_PKG_VERSION"), "latest": latest_release().await.unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()) })),
     _ => Err(Fail("unavailable")),
   }
 }
+
+/// The newest published engine version, from the project's releases.
+async fn latest_release() -> Option<String> {
+  let client = reqwest::Client::builder().timeout(Duration::from_secs(8)).user_agent("mildly-server").build().ok()?;
+  let v: Value = client.get(RELEASES).send().await.ok()?.error_for_status().ok()?.json().await.ok()?;
+  v["tag_name"].as_str().map(|t| t.trim_start_matches('v').to_string())
+}
+
+const RELEASES: &str = "https://api.github.com/repos/TheMildly/server/releases/latest";
 
 /// What the model or the app asked for beyond kind and name.
 fn spec(params: &Value) -> Spec {
@@ -276,11 +390,11 @@ fn pair(app: &Arc<App>, call: &Call, params: &Value) -> Out {
   if !crypto::verify(&device_key, &signed(call), &unb64(&call.s).unwrap_or_default()) {
     return Err(Fail("bad-request"));
   }
-  match pairing::check(app, &get("code")) {
-    Check::Ok => {}
+  let invite = match pairing::check(app, &unb64(&get("proof")).unwrap_or_default()) {
+    Check::Ok(invite) => invite,
     Check::Wrong => return Err(Fail("bad-code")),
     Check::Expired => return Err(Fail("expired")),
-  }
+  };
   let kind = match get("kind").as_str() {
     k @ ("phone" | "laptop" | "tablet" | "desktop") => k.to_string(),
     _ => "laptop".to_string(),
@@ -303,8 +417,14 @@ fn pair(app: &Arc<App>, call: &Call, params: &Value) -> Out {
       d
     })
     .map_err(Fail::from)?;
+  // Joined through an invite: the inviting device seals the space key for this one.
+  if let Some(id) = &invite {
+    if let Some(i) = app.invites.lock().expect("invites lock").get_mut(id) {
+      i.joined = Some((device.id.clone(), get("box"), get("boxTag")));
+    }
+  }
   tracing::info!("paired {} ({})", device.name, if device.owner { "owner" } else { "member" });
-  Ok(json!({ "server": server_info(app, &device), "device": device_info(&device, &device.id) }))
+  Ok(json!({ "server": server_info(app, &device), "device": device_info(&device, &device.id), "invited": invite.is_some() }))
 }
 
 async fn setup(app: &Arc<App>, device: &Device, params: &Value, host: &str) -> Out {
@@ -352,7 +472,7 @@ async fn snapshot(app: &Arc<App>, device: &Device, host: &str, with_devices: boo
   let mut out = json!({
     "server": server_info(app, device),
     "containers": containers,
-    "storage": [],
+    "storage": space::items(app),
     "addons": [
       { "id": "runtime", "kind": "engine", "enabled": app.containers.is_some(), "params": [
         { "key": "runtime", "value": app.config.runtime.label() },

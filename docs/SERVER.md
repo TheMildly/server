@@ -79,12 +79,31 @@ The app has to find the server from those 12 digits alone (the wizard has no add
      default, configurable on both sides, self-hostable). The topic name and the content
      mean nothing without the code.
 3. The QR code skips the search: `mildly://pair?c=<code>&k=<server key fingerprint>&a=<address>`.
-4. The app sends `pair` sealed to the announced server key: the code, the device name and
-   kind, and the device's public signing key. The first device becomes the owner. The answer
-   is the `ServerInfo` and the device record.
-5. The first device creates the space key on the device. Later devices join with an invite
-   made on a paired device (section 9), which hands them the space key sealed to their own
-   key; the engine only relays it.
+4. The app sends `pair` sealed to the announced server key: a **proof** that it knows the code
+   (`HMAC(codeKey, "proof")`, never the code itself), the device name and kind, the device's
+   public signing key, and a one-off ECDH **box** key with its tag `HMAC(codeKey, "box" ‖ box)`.
+   The first device becomes the owner. The answer is the `ServerInfo`, the device record, and
+   whether the code was an invite.
+5. The first device creates the space key on the device (section 6).
+
+**Invites.** A further device joins with a code made on a device that is already paired
+(Personal server → Add a device), so the engine never learns it:
+
+1. The inviting device picks the twelve digits, derives `codeKey`, and sends `invite.create`
+   with the topic, the announcement key and the proof. None of them reveals the code; the
+   engine announces the invite exactly like its own codes.
+2. The joining device pairs as above. The engine records it on the invite with its box key
+   and tag.
+3. The inviting device, waiting on `invite.status`, checks the tag with the code (the engine
+   cannot forge it), then seals the space key to the box: ECDH with a fresh key,
+   HKDF-SHA-256 with salt `HMAC(codeKey, "space")` and info `mildly-space-v1`, AES-256-GCM
+   with AAD `mildly-space`, and sends it with `invite.deliver`. A tag that does not match
+   removes the joined device instead.
+4. The joining device collects it with `space.receive`, opens it, and keeps it in its vault.
+
+A device paired later with an installer code (for example after losing every device) can
+manage the server but has no space key, so it cannot open stored files or chats; the app
+says so. A wrong proof counts against every open code.
 
 ## 4. The API
 
@@ -103,9 +122,14 @@ All methods go through `/v1/rpc`; names follow the contract.
 | `containers.write` / `.exec` / `.configure` | the model's tools | The engine's own containers only |
 | `terminal.open` / `.read` / `.write` / `.resize` / `.close` | `openTerminal` | `read` is a long poll (up to 25 s); sessions belong to the device that opened them |
 | `domain.search` / `.check` / `.set`, `quota.set` | address, space | `set` and `quota.set` are owner only |
+| `invite.create` / `.status` / `.deliver` / `.cancel`, `space.receive` | invites | `create` is owner only; the others belong to the device that made the invite, or that joined |
+| `devices.remove` | `removeDevice` | Owner only, not the calling device (that is `unpair`) |
+| `storage.list` / `.begin` / `.put` / `.end` / `.get` / `.remove` | storage | Pieces of up to 8 MB; `begin` checks the quota |
+| `context.put` / `.list` / `.drop`, `memory.put` / `.get` | chat sync | `list` returns what changed since a time |
+| `server.restart`, `update.check` | upkeep | `restart` is owner only; the engine exits and its service starts it again. `update.check` reads the latest release of `TheMildly/server` |
 | `storage.*`, `context.*` | storage, chat sync | Sealed blobs (section 6) |
 | `invite.*`, `devices.remove` | devices | Owner only |
-| `restart`, `update.check`, `notify.set`, `addon.set`, `mail.*` | server settings | |
+| `notify.set`, `addon.set`, `mail.*`, snapshots, moving | server settings | Not yet |
 
 Errors come back as `{code}`: `bad-code`, `expired`, `not-owner`, `not-found`, `exists`,
 `external`, `bad-name`, `bad-path`, `too-large`, `no-free-names`, `name-taken`,
@@ -160,9 +184,24 @@ Sessions end after fifteen idle minutes.
 ## 6. Files and chats
 
 The space key (AES-256-GCM) is made on the first device and travels only sealed between the
-user's devices. Personal files, generated media, chats and the memory list are encrypted with
-it before upload; the engine stores opaque blobs and an opaque, encrypted description, plus
-the size it needs for the quota. Generated media do not count against the personal quota.
+user's devices (section 3, invites). Everything below is encrypted with it on the device, as
+`iv ‖ ciphertext` with an AAD that names what it is, so one sealed thing cannot pass for
+another:
+
+| What | On the device | On the server |
+| --- | --- | --- |
+| A file | Split into 4 MiB pieces, each sealed with AAD `mildly-file:<fid>:<n>` (`fid` random per file). Its name, kind, type, size and piece count are sealed as the description (`mildly-desc`) | `blobs/<id>.bin` and `blobs/<id>.json`: origin, stored size, time, the sealed description |
+| A chat | The whole chat as JSON, AAD `mildly-chat:<id>` | `chats/<id>.bin`; its file time is when it last arrived |
+| The memory list | JSON, AAD `mildly-memory` | `memory.bin` |
+
+The engine knows sizes, times and the chat ids the app makes, nothing more. Personal files
+count against the quota chosen in setup (by their stored size); generated media do not.
+Chats are pulled at start-up and when the server pages open: `context.list` with the time of
+the newest copy seen, and the app keeps the newer of each.
+
+Removing a device stops it reaching the server; it still knows the space key it was given.
+Changing the space key when a device is removed (and re-sealing what is stored) is for a
+later version.
 
 ## 7. Addresses and HTTPS
 
@@ -220,8 +259,8 @@ install with `--binary`.
 | --- | --- | --- |
 | 1 | Engine skeleton, sealed RPC, pairing (code, QR, LAN, rendezvous), load, metrics, containers, installer; app side for the same | **done** — paired from the browser by the twelve digits through the rendezvous, set up, made a site container on Docker, started, stopped, read its log, removed it. The installer has not run on a real machine yet |
 | 2 | The model builds on the server (tools), apps already on the machine, terminals, free names, own domain, the HTTPS front | **done** — a scripted model listed, inspected, was refused writing into and restarting an app that was already there, made a site container joined to that app's network, wrote into it, ran a command that reached the old app, read files and logs; terminals in a container, in the old app and on the machine; the own domain and a free name (against a stand-in deSEC) served the site over HTTPS through Caddy, a site made later appeared under the address by itself, a taken name was refused. Not yet against the real deSEC or with real Let's Encrypt certificates |
-| 3 | Space key, storage, chat and memory sync, invites and device removal; restart, update check | |
-| 4 | Snapshots and moving, add-ons, mail (Stalwart) | |
+| 3 | Space key, storage, chat and memory sync, invites and device removal; restart, update check | **done** — two devices (separate browser profiles) on one engine: the first paired, uploaded a 5 MB file in two pieces, synced a chat and the memory list, and made an invite; the second joined with the typed code, got the space key, opened the file byte for byte and found the chat and memory. Nothing readable on the server's disk; quota refused an oversize file; a made-up code found no server; a removed device was shut out; restart came back with everything; removing the file deleted it |
+| 4 | Snapshots and moving, add-ons, mail (Stalwart), backups on the server, changing the space key when a device is removed | |
 | 5 | Directory for typed codes without the rendezvous; push | needs a project domain |
 
 ## 10. Decisions for the owner
@@ -233,3 +272,6 @@ install with `--binary`.
 2. **A project domain** for the directory and a short install address. Free names no longer
    need it (deSEC, section 7).
 3. ~~The rendezvous~~ — decided: `ntfy.sh`; a self-hosted ntfy can replace it with one setting.
+   ntfy.sh limits free messages per address and day. A server sends about five per code, so
+   that is far away for one server, but a machine on a shared address can hit it; codes then
+   still work on the local network and by QR code, and the engine's log says so.

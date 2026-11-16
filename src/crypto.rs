@@ -132,16 +132,25 @@ pub fn topic(code_key: &[u8; 32]) -> String {
   format!("mildly-{}", hex::encode(&mac.finalize().into_bytes()[..12]))
 }
 
-fn announce_key(code_key: &[u8; 32]) -> Aes256Gcm {
+/// `HMAC(codeKey, label)`: the proof a joining device sends is `code_tag(key, b"proof")`.
+pub fn code_tag(code_key: &[u8; 32], label: &[u8]) -> [u8; 32] {
+  let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(code_key).expect("hmac key");
+  mac.update(label);
+  mac.finalize().into_bytes().into()
+}
+
+/// The key the announcement is sealed with. An invite's device sends it instead of the code.
+pub fn announce_key(code_key: &[u8; 32]) -> [u8; 32] {
   let hk = Hkdf::<Sha256>::new(None, code_key);
   let mut key = [0u8; 32];
   hk.expand(b"mildly-announce-v1", &mut key).expect("hkdf");
-  Aes256Gcm::new_from_slice(&key).expect("32-byte key")
+  key
 }
 
 /// `base64url(iv ‖ ciphertext)` of the announcement JSON.
-pub fn seal_announcement(code_key: &[u8; 32], json: &[u8]) -> String {
-  let (iv, ct) = seal(&announce_key(code_key), json, b"mildly-announce");
+pub fn seal_announcement(announce_key: &[u8; 32], json: &[u8]) -> String {
+  let key = Aes256Gcm::new_from_slice(announce_key).expect("32-byte key");
+  let (iv, ct) = seal(&key, json, b"mildly-announce");
   let mut out = iv;
   out.extend_from_slice(&ct);
   b64(&out)
