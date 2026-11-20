@@ -3,7 +3,7 @@
 The personal server the Mildly app pairs with: a Rust engine (`mildly-server`) that runs the
 user's containers on Docker or Podman, answers the app over a sealed API, and serves sites
 under a free or own address through Caddy. The app lives in a separate repository
-(`sashinovsky/mildlydev`, folder `app/`); its `app/src/services/live/server.ts`,
+(`TheMildly/development`, folder `app/`); its `app/src/services/live/server.ts`,
 `server-wire.ts` and `server-tools.ts` are the other side of everything here.
 
 - `docs/SERVER.md` — trust model, pairing, the API, containers, addresses, install, the order
